@@ -14,6 +14,7 @@ UninstallDisplayIcon={app}\{#MyAppExeName}
 ArchitecturesAllowed=x64compatible
 ArchitecturesInstallIn64BitMode=x64compatible
 ChangesAssociations=no
+DisableDirPage=no
 DisableProgramGroupPage=yes
 OutputDir=dist\installer
 OutputBaseFilename=YTDownloader-Setup

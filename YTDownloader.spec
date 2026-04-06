@@ -9,9 +9,19 @@ from PyInstaller.utils.hooks import collect_all, collect_submodules
 
 project_dir = Path(SPECPATH).resolve()
 icon_file = project_dir / "assets" / "images" / "logo.ico"
+ffmpeg_dir = project_dir / "vendor" / "ffmpeg"
+
+if not ffmpeg_dir.exists():
+    raise SystemExit(
+        "Bundled FFmpeg was not found in vendor/ffmpeg. "
+        "Run build_installer.ps1 so the build can download it first."
+    )
 
 binaries = []
-datas = [(str(project_dir / "assets"), "assets")]
+datas = [
+    (str(project_dir / "assets"), "assets"),
+    (str(ffmpeg_dir), "vendor/ffmpeg"),
+]
 hiddenimports = collect_submodules("yt_dlp")
 
 ctk_datas, ctk_binaries, ctk_hiddenimports = collect_all("customtkinter")
