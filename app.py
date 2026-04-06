@@ -3,20 +3,25 @@
 Interactive YouTube downloader built with yt-dlp.
 
 Features:
-- Accepts a YouTube URL from the command line or an interactive prompt
+- Accepts a YouTube video or playlist URL from the command line or an interactive prompt
 - Extracts formats first and displays them in a numbered list
 - Supports video downloads (with audio merged when needed) and audio-only downloads
-- Supports optional Chrome browser cookies when login is needed
+- Supports playlist downloads into a playlist-named folder
+- Supports optional browser cookies when login is needed
 - Shows download progress directly in the terminal
 
-The code is intentionally beginner-friendly and split into small functions so it
-is easy to extend later.
+Playlist behavior:
+- Scans all videos in the playlist first
+- Lists the available grouped formats for each playlist item
+- Builds a menu of formats that are available across the whole playlist
+- Lets the user choose only from those common playlist-safe formats
 """
 
 from __future__ import annotations
 
 import argparse
 import os
+import re
 import sys
 import time
 from dataclasses import dataclass
@@ -27,10 +32,10 @@ from yt_dlp import YoutubeDL
 from yt_dlp.utils import DownloadError
 
 
-COOKIE_BROWSER = "chrome"
 COOKIE_SOURCE_NONE = "none"
 COOKIE_FALLBACK_BROWSERS = ("chrome", "edge", "brave")
 APP_TITLE = "YouTube Downloader CLI"
+
 AUTH_RELATED_ERROR_SNIPPETS = (
     "sign in",
     "confirm your age",
@@ -41,6 +46,7 @@ AUTH_RELATED_ERROR_SNIPPETS = (
     "private video",
     "this video is private",
 )
+
 YOUTUBE_HOSTS = {
     "youtube.com",
     "www.youtube.com",
@@ -61,6 +67,39 @@ class DownloadOption:
     kind: str
     format_id: str
     format_selector: str
+    resolution: str
+    extension: str
+    fps_text: str
+    audio_text: str
+    size_text: str
+    detail_text: str
+
+
+@dataclass
+class PlaylistEntry:
+    """Represents one flat-playlist item."""
+
+    title: str
+    url: str
+
+
+@dataclass
+class PlaylistScannedVideo:
+    """Formats discovered for one playlist video."""
+
+    title: str
+    url: str
+    option_by_key: dict[str, DownloadOption]
+    available_labels: list[str]
+
+
+@dataclass
+class PlaylistCommonOption:
+    """A normalized/common format choice available across the entire playlist."""
+
+    number: int
+    key: str
+    kind: str
     resolution: str
     extension: str
     fps_text: str
@@ -95,7 +134,6 @@ class ProgressPrinter:
 
         if status == "downloading":
             now = time.monotonic()
-            # Throttle updates so the terminal remains readable.
             if now - self._last_update < 0.1:
                 return
             self._last_update = now
@@ -147,7 +185,7 @@ def parse_arguments() -> argparse.Namespace:
     parser.add_argument(
         "url",
         nargs="?",
-        help="YouTube video URL. If omitted, the script asks for it interactively.",
+        help="YouTube video or playlist URL. If omitted, the script asks for it interactively.",
     )
     parser.add_argument(
         "--chrome-profile",
@@ -162,8 +200,8 @@ def parse_arguments() -> argparse.Namespace:
         "--use-browser-cookies",
         action="store_true",
         help=(
-            "Try browser cookies in this order: chrome, edge, brave. Use this "
-            "only when the video requires a logged-in browser session."
+            "Try browser cookies in this order: chrome, edge, brave. "
+            "Useful when the video requires a logged-in session."
         ),
     )
     parser.add_argument(
@@ -184,7 +222,6 @@ def normalize_and_validate_url(url: str) -> str:
     if not url:
         raise ValueError("No URL was provided.")
 
-    # Allow the user to paste youtube.com/... without typing https:// first.
     if "://" not in url:
         url = f"https://{url}"
 
@@ -192,7 +229,7 @@ def normalize_and_validate_url(url: str) -> str:
     host = parsed.netloc.lower()
 
     if host not in YOUTUBE_HOSTS:
-        raise ValueError("This CLI expects a YouTube video URL.")
+        raise ValueError("This CLI expects a YouTube video or playlist URL.")
 
     if host.endswith("youtu.be"):
         if parsed.path.strip("/"):
@@ -202,6 +239,9 @@ def normalize_and_validate_url(url: str) -> str:
     path = parsed.path.rstrip("/")
     query = parse_qs(parsed.query)
 
+    if query.get("list"):
+        return url
+
     if path == "/watch" and query.get("v"):
         return url
 
@@ -210,6 +250,11 @@ def normalize_and_validate_url(url: str) -> str:
         return url
 
     raise ValueError("The URL does not look like a direct YouTube video link.")
+
+
+def is_playlist_url(url: str) -> bool:
+    parsed = urlparse(url)
+    return bool(parse_qs(parsed.query).get("list"))
 
 
 def build_base_options(
@@ -232,6 +277,25 @@ def build_base_options(
     return options
 
 
+def build_playlist_options(
+    cookie_browser: str | None = None,
+    chrome_profile: str | None = None,
+    output_dir: str | None = None,
+) -> dict:
+    options = build_base_options(
+        cookie_browser=cookie_browser,
+        chrome_profile=chrome_profile,
+        output_dir=output_dir,
+    )
+    options.update(
+        {
+            "noplaylist": False,
+            "extract_flat": "in_playlist",
+        }
+    )
+    return options
+
+
 def extract_video_info(
     url: str, use_chrome_cookies: bool, chrome_profile: str | None, output_dir: str
 ) -> tuple[dict, str]:
@@ -242,10 +306,10 @@ def extract_video_info(
         with YoutubeDL(build_base_options(output_dir=output_dir)) as ydl:
             info = ydl.extract_info(url, download=False)
         return unwrap_video_info(info), COOKIE_SOURCE_NONE
-    except Exception as exc:  # yt-dlp raises multiple exception types here.
+    except Exception as exc:
         if is_auth_related_error(exc):
             print(
-                "Metadata requires a logged-in session! Retrying with browser cookies...",
+                "Metadata requires a logged-in session. Retrying with browser cookies...",
                 file=sys.stderr,
             )
             return extract_video_info_with_cookie_fallback(
@@ -273,7 +337,56 @@ def extract_video_info_with_cookie_fallback(
             ) as ydl:
                 info = ydl.extract_info(url, download=False)
             return unwrap_video_info(info), browser
-        except Exception as exc:  # yt-dlp raises multiple exception types here.
+        except Exception as exc:
+            cookie_errors.append((browser, exc))
+
+    raise RuntimeError(
+        build_cookie_error_message(cookie_errors, chrome_profile, initial_error)
+    )
+
+
+def extract_playlist_info(
+    url: str, use_chrome_cookies: bool, chrome_profile: str | None, output_dir: str
+) -> tuple[dict, str]:
+    if use_chrome_cookies:
+        return extract_playlist_info_with_cookie_fallback(url, chrome_profile, output_dir)
+
+    try:
+        with YoutubeDL(build_playlist_options(output_dir=output_dir)) as ydl:
+            info = ydl.extract_info(url, download=False)
+        return info, COOKIE_SOURCE_NONE
+    except Exception as exc:
+        if is_auth_related_error(exc):
+            print(
+                "Playlist metadata requires a logged-in session. Retrying with browser cookies...",
+                file=sys.stderr,
+            )
+            return extract_playlist_info_with_cookie_fallback(
+                url, chrome_profile, output_dir, initial_error=exc
+            )
+        raise RuntimeError(build_playlist_error_message(exc)) from exc
+
+
+def extract_playlist_info_with_cookie_fallback(
+    url: str,
+    chrome_profile: str | None,
+    output_dir: str,
+    initial_error: Exception | None = None,
+) -> tuple[dict, str]:
+    cookie_errors: list[tuple[str, Exception]] = []
+
+    for browser in COOKIE_FALLBACK_BROWSERS:
+        try:
+            with YoutubeDL(
+                build_playlist_options(
+                    cookie_browser=browser,
+                    chrome_profile=chrome_profile,
+                    output_dir=output_dir,
+                )
+            ) as ydl:
+                info = ydl.extract_info(url, download=False)
+            return info, browser
+        except Exception as exc:
             cookie_errors.append((browser, exc))
 
     raise RuntimeError(
@@ -287,6 +400,28 @@ def unwrap_video_info(info: dict) -> dict:
         if entry:
             return entry
     return info
+
+
+def build_playlist_entries(playlist_info: dict) -> list[PlaylistEntry]:
+    entries: list[PlaylistEntry] = []
+
+    for item in playlist_info.get("entries") or []:
+        if not item:
+            continue
+
+        video_id = item.get("id")
+        if not video_id:
+            continue
+
+        title = item.get("title") or str(video_id)
+        entries.append(
+            PlaylistEntry(
+                title=title,
+                url=f"https://www.youtube.com/watch?v={video_id}",
+            )
+        )
+
+    return entries
 
 
 def build_download_options(info: dict) -> tuple[list[DownloadOption], list[DownloadOption]]:
@@ -453,6 +588,302 @@ def get_resolution_text(format_info: dict) -> str:
     return "unknown"
 
 
+def sanitize_path_component(name: str) -> str:
+    cleaned = re.sub(r'[<>:"/\\|?*]', "_", name).strip().rstrip(".")
+    return cleaned or "Playlist"
+
+
+def create_playlist_output_dir(base_output_dir: str, playlist_title: str) -> str:
+    playlist_dir = os.path.join(base_output_dir, sanitize_path_component(playlist_title))
+    os.makedirs(playlist_dir, exist_ok=True)
+    return playlist_dir
+
+
+def parse_first_number(text: str) -> int:
+    match = re.search(r"(\d+)", text or "")
+    return int(match.group(1)) if match else 0
+
+
+def parse_audio_bitrate(detail_text: str) -> int:
+    left_side = (detail_text or "").split("|", maxsplit=1)[0].strip()
+    return parse_first_number(left_side)
+
+
+def make_playlist_group_key(option: DownloadOption) -> str:
+    if option.kind == "Video":
+        return f"video::{option.resolution}::{option.extension}"
+    return f"audio::{option.extension}"
+
+
+def is_better_group_match(candidate: DownloadOption, current: DownloadOption) -> bool:
+    if candidate.kind == "Video":
+        candidate_fps = parse_first_number(candidate.fps_text)
+        current_fps = parse_first_number(current.fps_text)
+
+        if candidate_fps != current_fps:
+            return candidate_fps > current_fps
+
+        candidate_audio_pref = 1 if candidate.audio_text == "yes" else 0
+        current_audio_pref = 1 if current.audio_text == "yes" else 0
+        if candidate_audio_pref != current_audio_pref:
+            return candidate_audio_pref > current_audio_pref
+
+        candidate_size = parse_size_guess(candidate.size_text)
+        current_size = parse_size_guess(current.size_text)
+        return candidate_size > current_size
+
+    candidate_bitrate = parse_audio_bitrate(candidate.detail_text)
+    current_bitrate = parse_audio_bitrate(current.detail_text)
+
+    if candidate_bitrate != current_bitrate:
+        return candidate_bitrate > current_bitrate
+
+    candidate_size = parse_size_guess(candidate.size_text)
+    current_size = parse_size_guess(current.size_text)
+    return candidate_size > current_size
+
+
+def parse_size_guess(size_text: str) -> float:
+    if not size_text or size_text == "unknown":
+        return 0.0
+
+    match = re.match(r"([\d.]+)\s*([A-Za-z]+)", size_text.strip())
+    if not match:
+        return 0.0
+
+    value = float(match.group(1))
+    unit = match.group(2).upper()
+
+    unit_scale = {
+        "B": 1,
+        "KB": 1024,
+        "MB": 1024**2,
+        "GB": 1024**3,
+        "TB": 1024**4,
+    }
+    return value * unit_scale.get(unit, 1)
+
+
+def build_playlist_option_mapping(
+    video_options: list[DownloadOption], audio_options: list[DownloadOption]
+) -> dict[str, DownloadOption]:
+    mapping: dict[str, DownloadOption] = {}
+
+    for option in video_options + audio_options:
+        key = make_playlist_group_key(option)
+        current = mapping.get(key)
+        if current is None or is_better_group_match(option, current):
+            mapping[key] = option
+
+    return mapping
+
+
+def build_playlist_option_label(option: DownloadOption) -> str:
+    if option.kind == "Video":
+        return (
+            f"{option.resolution} | {option.extension} | "
+            f"{option.fps_text} | {option.audio_text}"
+        )
+
+    bitrate = parse_audio_bitrate(option.detail_text)
+    bitrate_text = f"{bitrate} kbps" if bitrate else option.detail_text.split("|", 1)[0].strip()
+    return f"audio only | {option.extension} | {bitrate_text}"
+
+
+def sort_playlist_grouped_options(options: list[DownloadOption]) -> list[DownloadOption]:
+    return sorted(
+        options,
+        key=lambda option: (
+            option.kind != "Video",
+            -parse_first_number(option.resolution) if option.kind == "Video" else 0,
+            option.extension,
+            -parse_audio_bitrate(option.detail_text) if option.kind == "Audio" else 0,
+        ),
+    )
+
+
+def scan_playlist_formats(
+    playlist_entries: list[PlaylistEntry],
+    use_chrome_cookies: bool,
+    chrome_profile: str | None,
+    output_dir: str,
+) -> list[PlaylistScannedVideo]:
+    print_section("Playlist Format Scan")
+    print("Scanning all videos in the playlist to discover available formats...")
+
+    scanned: list[PlaylistScannedVideo] = []
+
+    for index, entry in enumerate(playlist_entries, start=1):
+        print(f"  [{index}/{len(playlist_entries)}] {entry.title}")
+
+        try:
+            info, _ = extract_video_info(
+                entry.url,
+                use_chrome_cookies,
+                chrome_profile,
+                output_dir,
+            )
+            video_options, audio_options = build_download_options(info)
+            option_by_key = build_playlist_option_mapping(video_options, audio_options)
+            grouped_options = sort_playlist_grouped_options(list(option_by_key.values()))
+            available_labels = [build_playlist_option_label(option) for option in grouped_options]
+
+            scanned.append(
+                PlaylistScannedVideo(
+                    title=entry.title,
+                    url=entry.url,
+                    option_by_key=option_by_key,
+                    available_labels=available_labels,
+                )
+            )
+        except RuntimeError as exc:
+            raise RuntimeError(
+                f"Unable to scan playlist formats.\n"
+                f"Video: {entry.title}\n"
+                f"Details:\n  - {clean_ydl_error(exc)}"
+            ) from exc
+
+    return scanned
+
+
+def build_common_playlist_options(
+    scanned_videos: list[PlaylistScannedVideo],
+) -> list[PlaylistCommonOption]:
+    if not scanned_videos:
+        return []
+
+    common_keys = set(scanned_videos[0].option_by_key.keys())
+    for scanned in scanned_videos[1:]:
+        common_keys &= set(scanned.option_by_key.keys())
+
+    if not common_keys:
+        return []
+
+    representative_pairs = [
+        (key, scanned_videos[0].option_by_key[key])
+        for key in common_keys
+    ]
+    representative_pairs.sort(
+        key=lambda item: (
+            item[1].kind != "Video",
+            -parse_first_number(item[1].resolution) if item[1].kind == "Video" else 0,
+            item[1].extension,
+            -parse_audio_bitrate(item[1].detail_text) if item[1].kind == "Audio" else 0,
+        )
+    )
+
+    common_options: list[PlaylistCommonOption] = []
+
+    for number, (key, representative) in enumerate(representative_pairs, start=1):
+        matched_options = [scanned.option_by_key[key] for scanned in scanned_videos]
+
+        if representative.kind == "Video":
+            fps_values = [parse_first_number(option.fps_text) for option in matched_options]
+            fps_values = [value for value in fps_values if value > 0]
+
+            if not fps_values:
+                fps_text = "-"
+            elif min(fps_values) == max(fps_values):
+                fps_text = f"{fps_values[0]} fps"
+            else:
+                fps_text = f"{min(fps_values)}-{max(fps_values)} fps"
+
+            audio_values = {option.audio_text for option in matched_options}
+            audio_text = next(iter(audio_values)) if len(audio_values) == 1 else "mixed"
+
+            detail_text = f"available in all {len(scanned_videos)} videos"
+
+            common_options.append(
+                PlaylistCommonOption(
+                    number=number,
+                    key=key,
+                    kind="Video",
+                    resolution=representative.resolution,
+                    extension=representative.extension,
+                    fps_text=fps_text,
+                    audio_text=audio_text,
+                    size_text="playlist",
+                    detail_text=detail_text,
+                )
+            )
+            continue
+
+        bitrate_values = [parse_audio_bitrate(option.detail_text) for option in matched_options]
+        bitrate_values = [value for value in bitrate_values if value > 0]
+
+        if not bitrate_values:
+            detail_text = f"{representative.extension} audio in all {len(scanned_videos)} videos"
+        elif min(bitrate_values) == max(bitrate_values):
+            detail_text = f"{bitrate_values[0]} kbps in all {len(scanned_videos)} videos"
+        else:
+            detail_text = (
+                f"{min(bitrate_values)}-{max(bitrate_values)} kbps "
+                f"across {len(scanned_videos)} videos"
+            )
+
+        common_options.append(
+            PlaylistCommonOption(
+                number=number,
+                key=key,
+                kind="Audio",
+                resolution="audio only",
+                extension=representative.extension,
+                fps_text="-",
+                audio_text="yes",
+                size_text="playlist",
+                detail_text=detail_text,
+            )
+        )
+
+    return common_options
+
+
+def print_playlist_video_formats(scanned_videos: list[PlaylistScannedVideo]) -> None:
+    print_section("Available Formats Per Playlist Video")
+    for index, scanned in enumerate(scanned_videos, start=1):
+        print(f"{index}. {scanned.title}")
+        for label in scanned.available_labels:
+            print(f"   - {label}")
+        print()
+
+
+def print_playlist_common_format_menu(common_options: list[PlaylistCommonOption]) -> None:
+    print_section("Common Playlist Formats")
+    print(
+        f"{'#':<4} {'Type':<8} {'Resolution':<14} {'Ext':<6} "
+        f"{'FPS':<10} {'Audio':<8} {'Size':<12} Details"
+    )
+    print("-" * 110)
+
+    for option in common_options:
+        print(render_option_line(option))
+
+    print("-" * 110)
+    print("Choose one of the common playlist formats above, or q to quit.")
+
+
+def prompt_for_playlist_common_option(
+    options: list[PlaylistCommonOption],
+) -> PlaylistCommonOption | None:
+    lookup = {str(option.number): option for option in options}
+
+    while True:
+        choice = input("Format: ").strip().lower()
+
+        if choice in {"q", "quit", "exit"}:
+            return None
+        if choice in lookup:
+            return lookup[choice]
+
+        print("Please enter one of the listed numbers, or q to quit.")
+
+
+def print_available_formats_from_scan(scanned_video: PlaylistScannedVideo) -> None:
+    print("  Available formats:")
+    for label in scanned_video.available_labels:
+        print(f"    - {label}")
+
+
 def print_video_summary(info: dict, cookie_browser: str) -> None:
     title = info.get("title", "Unknown title")
     uploader = info.get("uploader") or info.get("channel") or "Unknown uploader"
@@ -470,9 +901,30 @@ def print_video_summary(info: dict, cookie_browser: str) -> None:
     print_key_value("Cookies", cookie_text)
 
 
+def print_playlist_summary(
+    playlist_info: dict, playlist_entries: list[PlaylistEntry], cookie_browser: str
+) -> None:
+    title = playlist_info.get("title") or "Unknown playlist"
+    uploader = playlist_info.get("uploader") or playlist_info.get("channel") or "-"
+    cookie_text = (
+        "not using browser cookies"
+        if cookie_browser == COOKIE_SOURCE_NONE
+        else f"using {cookie_browser} browser cookies"
+    )
+
+    print_section("Playlist")
+    print_key_value("Title", title)
+    print_key_value("Channel", uploader)
+    print_key_value("Videos", str(len(playlist_entries)))
+    print_key_value("Cookies", cookie_text)
+
+
 def print_format_menu(video_options: list[DownloadOption], audio_options: list[DownloadOption]) -> None:
     print_section("Formats")
-    print(f"{'#':<4} {'Type':<8} {'Resolution':<14} {'Ext':<6} {'FPS':<8} {'Audio':<8} {'Size':<12} Details")
+    print(
+        f"{'#':<4} {'Type':<8} {'Resolution':<14} {'Ext':<6} "
+        f"{'FPS':<8} {'Audio':<8} {'Size':<12} Details"
+    )
     print("-" * 100)
 
     if video_options:
@@ -491,16 +943,16 @@ def print_format_menu(video_options: list[DownloadOption], audio_options: list[D
     print("Enter a format number, or q to quit.")
 
 
-def render_option_line(option: DownloadOption) -> str:
+def render_option_line(option: object) -> str:
     return (
-        f"{option.number:<4} "
-        f"{option.kind:<8} "
-        f"{option.resolution:<14} "
-        f"{option.extension:<6} "
-        f"{option.fps_text:<8} "
-        f"{option.audio_text:<8} "
-        f"{option.size_text:<12} "
-        f"{option.detail_text}"
+        f"{getattr(option, 'number'):<4} "
+        f"{getattr(option, 'kind'):<8} "
+        f"{getattr(option, 'resolution'):<14} "
+        f"{getattr(option, 'extension'):<6} "
+        f"{getattr(option, 'fps_text'):<10} "
+        f"{getattr(option, 'audio_text'):<8} "
+        f"{getattr(option, 'size_text'):<12} "
+        f"{getattr(option, 'detail_text')}"
     )
 
 
@@ -609,7 +1061,7 @@ def clean_ydl_error(error: Exception) -> str:
     message = str(error).strip()
     for prefix in ("ERROR: ERROR: ", "ERROR: "):
         if message.startswith(prefix):
-            message = message[len(prefix) :]
+            message = message[len(prefix):]
     return message
 
 
@@ -621,6 +1073,11 @@ def is_auth_related_error(error: Exception) -> bool:
 def build_metadata_error_message(error: Exception) -> str:
     details = clean_ydl_error(error)
     return f"Unable to read YouTube metadata.\nDetails:\n  - {details}"
+
+
+def build_playlist_error_message(error: Exception) -> str:
+    details = clean_ydl_error(error)
+    return f"Unable to read playlist metadata.\nDetails:\n  - {details}"
 
 
 def build_cookie_error_message(
@@ -635,6 +1092,7 @@ def build_cookie_error_message(
     initial_details = ""
     if initial_error is not None:
         initial_details = f"Initial no-cookie error:\n  - {clean_ydl_error(initial_error)}\n"
+
     return (
         "Unable to complete the YouTube request using browser cookies.\n"
         f"Profile: {profile_text}\n"
@@ -646,9 +1104,8 @@ def build_cookie_error_message(
         "  2. Run the terminal as the same Windows user who uses Chrome.\n"
         "  3. Do not run the terminal elevated if Chrome is used normally.\n"
         "  4. If your YouTube login is in another profile, run with "
-        "`--chrome-profile \"Profile 1\"` or the correct profile name.\n"
-        "  5. If Chrome still fails, sign in to YouTube in Edge or Brave and try "
-        "again with the same command.\n"
+        '`--chrome-profile "Profile 1"` or the correct profile name.\n'
+        "  5. If Chrome still fails, sign in to YouTube in Edge or Brave and try again.\n"
         f"{initial_details}Details:\n{browser_results}"
     )
 
@@ -683,7 +1140,7 @@ def print_header() -> None:
     print(line)
     print(APP_TITLE)
     print(line)
-    print("Paste a YouTube video URL, choose a save folder, then pick a format.\n")
+    print("Paste a YouTube video or playlist URL, choose a save folder, then pick a format.\n")
 
 
 def print_section(title: str) -> None:
@@ -695,10 +1152,13 @@ def print_key_value(label: str, value: str) -> None:
     print(f"{label:<10}: {value}")
 
 
-def prompt_for_output_dir(initial_output_dir: str) -> str:
+def prompt_for_output_dir(initial_output_dir: str, playlist_name: str | None = None) -> str:
     while True:
         print_section("Save Location")
         print_key_value("Current", initial_output_dir)
+        if playlist_name:
+            print_key_value("Playlist", playlist_name)
+            print("A new folder with the playlist name will be created inside this location.")
         print("Press Enter to keep this folder, or type a new path.")
         choice = input("Folder: ").strip().strip('"')
 
@@ -721,9 +1181,101 @@ def main() -> int:
     try:
         print_header()
         url = normalize_and_validate_url(prompt_for_url(args.url))
+
+        if is_playlist_url(url):
+            playlist_info, cookie_browser = extract_playlist_info(
+                url, use_chrome_cookies, args.chrome_profile, output_dir
+            )
+            playlist_entries = build_playlist_entries(playlist_info)
+            if not playlist_entries:
+                raise RuntimeError("No videos were found in this playlist.")
+
+            playlist_title = playlist_info.get("title") or "Playlist"
+
+            print_playlist_summary(playlist_info, playlist_entries, cookie_browser)
+
+            scanned_videos = scan_playlist_formats(
+                playlist_entries=playlist_entries,
+                use_chrome_cookies=use_chrome_cookies,
+                chrome_profile=args.chrome_profile,
+                output_dir=output_dir,
+            )
+
+            print_playlist_video_formats(scanned_videos)
+
+            common_options = build_common_playlist_options(scanned_videos)
+            if not common_options:
+                raise RuntimeError(
+                    "No common downloadable format was found across the whole playlist.\n"
+                    "Try downloading videos individually, or split the playlist into smaller groups."
+                )
+
+            print_playlist_common_format_menu(common_options)
+
+            selected_common_option = prompt_for_playlist_common_option(common_options)
+            if selected_common_option is None:
+                print("Playlist download cancelled.")
+                return 0
+
+            if args.output_dir is None:
+                output_dir = prompt_for_output_dir(output_dir, playlist_title)
+            playlist_output_dir = create_playlist_output_dir(output_dir, playlist_title)
+
+            print_section("Starting Playlist")
+            print_key_value("Playlist", playlist_title)
+            print_key_value("Videos", str(len(scanned_videos)))
+            print_key_value(
+                "Selection",
+                f"{selected_common_option.kind} | {selected_common_option.resolution} | "
+                f"{selected_common_option.extension}",
+            )
+            print_key_value("Save to", playlist_output_dir)
+
+            downloaded_count = 0
+            skipped_items: list[str] = []
+
+            for index, scanned_video in enumerate(scanned_videos, start=1):
+                actual_option = scanned_video.option_by_key[selected_common_option.key]
+
+                print_section(f"Item {index}/{len(scanned_videos)}")
+                print_key_value("Title", scanned_video.title)
+                print_key_value(
+                    "Target",
+                    f"{actual_option.kind} | {actual_option.resolution} | "
+                    f"{actual_option.extension} | {actual_option.detail_text}",
+                )
+
+                try:
+                    download_media(
+                        scanned_video.url,
+                        actual_option,
+                        cookie_browser,
+                        args.chrome_profile,
+                        playlist_output_dir,
+                    )
+                    downloaded_count += 1
+                except RuntimeError as exc:
+                    error_text = clean_ydl_error(exc)
+                    skipped_items.append(f"{scanned_video.title}: {error_text}")
+                    print(f"  Skipping: {error_text}")
+                    print_available_formats_from_scan(scanned_video)
+
+            print_section("Playlist Summary")
+            print_key_value("Downloaded", str(downloaded_count))
+            print_key_value("Skipped", str(len(skipped_items)))
+
+            if skipped_items:
+                print_section("Skipped Items")
+                for item in skipped_items:
+                    print(f"- {item}")
+
+            print(f"Saved playlist to: {playlist_output_dir}")
+            return 0
+
         info, cookie_browser = extract_video_info(
             url, use_chrome_cookies, args.chrome_profile, output_dir
         )
+
         if args.output_dir is None:
             output_dir = prompt_for_output_dir(output_dir)
 
@@ -746,6 +1298,7 @@ def main() -> int:
             f"{selected_option.kind} | {selected_option.resolution} | "
             f"{selected_option.extension} | {selected_option.detail_text}",
         )
+
         download_media(
             url,
             selected_option,
