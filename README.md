@@ -1,6 +1,7 @@
 # YTDownloader
 
 A Windows-friendly YouTube downloader with a desktop UI and optional CLI mode.
+<img width="full" alt="Screenshot 2026-04-06 223507" src="https://github.com/user-attachments/assets/2bd8f83d-d462-46a9-b068-e0a9be3f50d2" />
 
 ## What It Does
 
